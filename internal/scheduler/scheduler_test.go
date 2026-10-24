@@ -2,6 +2,8 @@ package scheduler
 
 import (
 	"context"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -9,143 +11,218 @@ import (
 	"github.com/ASmbat/integration-sync/internal/store"
 )
 
-// slowConnector simulates a vendor whose Sync call takes a while — a slow
-// or struggling third-party API, not necessarily a broken one.
-type slowConnector struct {
-	id string
-	d  time.Duration
+// notifyStore wraps the memory store and reports every Set on a channel,
+// so tests can wait for a sync without time.Sleep.
+type notifyStore struct {
+	*store.MemoryStatusStore
+	sets chan string
 }
 
-func (c *slowConnector) ID() string          { return c.id }
-func (c *slowConnector) DisplayName() string { return c.id }
-func (c *slowConnector) Sync(ctx context.Context) (connector.SyncResult, error) {
-	time.Sleep(c.d)
+func newNotifyStore() *notifyStore {
+	return &notifyStore{MemoryStatusStore: store.NewMemoryStatusStore(), sets: make(chan string, 100)}
+}
+
+func (s *notifyStore) Set(id string, r connector.SyncResult) {
+	s.MemoryStatusStore.Set(id, r)
+	s.sets <- id
+}
+
+func (s *notifyStore) waitFor(t *testing.T, id string) {
+	t.Helper()
+	timeout := time.After(time.Second)
+	for {
+		select {
+		case got := <-s.sets:
+			if got == id {
+				return
+			}
+		case <-timeout:
+			t.Fatalf("timed out waiting for a sync of %q", id)
+		}
+	}
+}
+
+// blockingConnector signals on started when Sync begins and returns only
+// after release is closed. It also records the highest number of Sync
+// calls that ran at the same time.
+type blockingConnector struct {
+	id         string
+	started    chan struct{}
+	release    chan struct{}
+	active     int64
+	maxActive  int64
+	totalCalls int64
+}
+
+func newBlockingConnector(id string) *blockingConnector {
+	return &blockingConnector{id: id, started: make(chan struct{}, 10), release: make(chan struct{})}
+}
+
+func (c *blockingConnector) ID() string          { return c.id }
+func (c *blockingConnector) DisplayName() string { return c.id }
+func (c *blockingConnector) Sync(ctx context.Context) (connector.SyncResult, error) {
+	n := atomic.AddInt64(&c.active, 1)
+	defer atomic.AddInt64(&c.active, -1)
+	atomic.AddInt64(&c.totalCalls, 1)
+	for {
+		m := atomic.LoadInt64(&c.maxActive)
+		if n <= m || atomic.CompareAndSwapInt64(&c.maxActive, m, n) {
+			break
+		}
+	}
+	c.started <- struct{}{}
+	<-c.release
 	return connector.SyncResult{Status: connector.StatusOK, SyncedAt: time.Now()}, nil
 }
 
-// panicConnector simulates a connector whose vendor-specific code panics
-// (e.g. on an unexpected response shape) instead of returning an error.
 type panicConnector struct{ id string }
 
 func (c *panicConnector) ID() string          { return c.id }
 func (c *panicConnector) DisplayName() string { return c.id }
-func (c *panicConnector) Sync(ctx context.Context) (connector.SyncResult, error) {
-	var m map[string]int
-	m["x"] = 1 // panics: assignment to entry in nil map
-	return connector.SyncResult{}, nil
+func (c *panicConnector) Sync(context.Context) (connector.SyncResult, error) {
+	panic("unexpected vendor response")
 }
 
 func TestScheduler_RunsImmediateSyncOnStart(t *testing.T) {
-	statusStore := store.NewMemoryStatusStore()
-	sched := New(statusStore)
-	mock := connector.NewMockConnector("demo", 0)
-	sched.Register(mock, time.Hour) // long interval; we only care about the immediate run
+	st := newNotifyStore()
+	sched := New(st)
+	sched.Register(connector.NewMockConnector("demo", 0), time.Hour)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go sched.Start(ctx)
 
-	// Give the immediate sync goroutine a moment to run.
-	time.Sleep(50 * time.Millisecond)
-
-	result, ok := statusStore.Get("demo")
-	if !ok {
-		t.Fatal("expected a status to be recorded after start")
+	st.waitFor(t, "demo")
+	if r, _ := st.Get("demo"); r.Status != connector.StatusOK {
+		t.Errorf("expected StatusOK, got %s", r.Status)
 	}
-	if result.Status != connector.StatusOK {
-		t.Errorf("expected StatusOK, got %s", result.Status)
+}
+
+func TestScheduler_RegisterAfterStartRuns(t *testing.T) {
+	st := newNotifyStore()
+	sched := New(st)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go sched.Start(ctx)
+
+	sched.Register(connector.NewMockConnector("late", 0), time.Hour)
+	st.waitFor(t, "late") // would time out if late registrations were ignored
+}
+
+func TestScheduler_StartReturnsAfterCancel(t *testing.T) {
+	sched := New(store.NewMemoryStatusStore())
+	sched.Register(connector.NewMockConnector("demo", 0), time.Hour)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { sched.Start(ctx); close(done) }()
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Start did not return after its context was cancelled")
 	}
 }
 
 func TestScheduler_SyncNow(t *testing.T) {
-	statusStore := store.NewMemoryStatusStore()
-	sched := New(statusStore)
-	mock := connector.NewMockConnector("demo", 0)
-	sched.Register(mock, time.Hour)
+	st := store.NewMemoryStatusStore()
+	sched := New(st)
+	sched.Register(connector.NewMockConnector("demo", 0), time.Hour)
 
 	result, found := sched.SyncNow(context.Background(), "demo")
-	if !found {
-		t.Fatal("expected connector to be found")
+	if !found || result.Status != connector.StatusOK {
+		t.Fatalf("got found=%v result=%+v", found, result)
 	}
-	if result.Status != connector.StatusOK {
-		t.Errorf("expected StatusOK, got %s", result.Status)
-	}
-
-	stored, ok := statusStore.Get("demo")
-	if !ok || stored.RecordsSynced != result.RecordsSynced {
-		t.Errorf("expected SyncNow result to be persisted in the store")
+	if stored, ok := st.Get("demo"); !ok || stored.RecordsSynced != result.RecordsSynced {
+		t.Error("expected SyncNow result to be saved in the store")
 	}
 }
 
 func TestScheduler_SyncNow_UnknownConnector(t *testing.T) {
 	sched := New(store.NewMemoryStatusStore())
-	_, found := sched.SyncNow(context.Background(), "does-not-exist")
-	if found {
-		t.Error("expected found=false for unregistered connector")
+	if _, found := sched.SyncNow(context.Background(), "does-not-exist"); found {
+		t.Error("expected found=false for an unregistered connector")
 	}
 }
 
-func TestScheduler_SyncNow_DoesNotBlockOnUnrelatedSlowConnector(t *testing.T) {
+func TestScheduler_SyncNow_DoesNotWaitForOtherConnectors(t *testing.T) {
 	sched := New(store.NewMemoryStatusStore())
-	sched.Register(&slowConnector{id: "slow", d: 300 * time.Millisecond}, time.Hour)
+	slow := newBlockingConnector("slow")
+	defer close(slow.release)
+	sched.Register(slow, time.Hour)
 	sched.Register(connector.NewMockConnector("fast", 0), time.Hour)
 
 	go sched.SyncNow(context.Background(), "slow")
-	time.Sleep(30 * time.Millisecond) // let the slow sync actually start and take the lookup lock
+	<-slow.started // the slow sync is now in progress
 
-	done := make(chan time.Duration, 1)
-	go func() {
-		start := time.Now()
-		sched.SyncNow(context.Background(), "fast")
-		done <- time.Since(start)
-	}()
+	done := make(chan struct{})
+	go func() { sched.SyncNow(context.Background(), "fast"); close(done) }()
 
 	select {
-	case elapsed := <-done:
-		if elapsed > 150*time.Millisecond {
-			t.Fatalf("SyncNow for an unrelated connector took %s; it should not wait on the slow connector's Sync call", elapsed)
-		}
+	case <-done:
 	case <-time.After(time.Second):
-		t.Fatal("SyncNow for the fast connector never returned — it's blocked behind the slow one")
+		t.Fatal("SyncNow for the fast connector is blocked behind the slow one")
+	}
+}
+
+func TestScheduler_NoOverlappingSyncsForSameConnector(t *testing.T) {
+	sched := New(store.NewMemoryStatusStore())
+	c := newBlockingConnector("vendor")
+	sched.Register(c, time.Hour)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); sched.SyncNow(context.Background(), "vendor") }()
+	}
+	for i := 0; i < 3; i++ {
+		<-c.started
+		c.release <- struct{}{} // let one sync finish at a time
+	}
+	wg.Wait()
+
+	if got := atomic.LoadInt64(&c.maxActive); got != 1 {
+		t.Fatalf("expected at most 1 concurrent Sync, saw %d", got)
+	}
+	if got := atomic.LoadInt64(&c.totalCalls); got != 3 {
+		t.Fatalf("expected 3 syncs, got %d", got)
 	}
 }
 
 func TestScheduler_SyncNow_RecoversConnectorPanic(t *testing.T) {
-	statusStore := store.NewMemoryStatusStore()
-	sched := New(statusStore)
+	st := store.NewMemoryStatusStore()
+	sched := New(st)
 	sched.Register(&panicConnector{id: "panicky"}, time.Hour)
 
-	// If the panic isn't recovered, this test process crashes outright
-	// rather than failing normally — so getting a result back at all is
-	// part of what's being verified.
+	// An unrecovered panic would crash the test binary instead of failing.
 	result, found := sched.SyncNow(context.Background(), "panicky")
-	if !found {
-		t.Fatal("expected connector to be found")
+	if !found || result.Status != connector.StatusError {
+		t.Fatalf("got found=%v result=%+v", found, result)
 	}
-	if result.Status != connector.StatusError {
-		t.Errorf("expected a panicking connector to report StatusError, got %s", result.Status)
-	}
-
-	stored, ok := statusStore.Get("panicky")
-	if !ok || stored.Status != connector.StatusError {
-		t.Errorf("expected the error status to be persisted in the store")
+	if stored, ok := st.Get("panicky"); !ok || stored.Status != connector.StatusError {
+		t.Error("expected the error status to be saved in the store")
 	}
 }
 
 func TestScheduler_RunLoop_SurvivesConnectorPanic(t *testing.T) {
-	statusStore := store.NewMemoryStatusStore()
-	sched := New(statusStore)
-	sched.Register(&panicConnector{id: "panicky"}, 30*time.Millisecond)
+	st := newNotifyStore()
+	sched := New(st)
+	sched.Register(&panicConnector{id: "panicky"}, 10*time.Millisecond)
 	sched.Register(connector.NewMockConnector("healthy", 0), time.Hour)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	defer cancel()
-	sched.Start(ctx) // would crash the test binary if the panic weren't recovered
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { sched.Start(ctx); close(done) }()
 
-	if _, ok := statusStore.Get("healthy"); !ok {
-		t.Error("expected the healthy connector to still have run despite the other one panicking")
-	}
-	if status, ok := statusStore.Get("panicky"); !ok || status.Status != connector.StatusError {
-		t.Errorf("expected the panicking connector's status to be recorded as an error, got %+v (ok=%v)", status, ok)
+	st.waitFor(t, "healthy")
+	st.waitFor(t, "panicky")
+	st.waitFor(t, "panicky") // the loop kept ticking after the first panic
+	cancel()
+	<-done
+
+	if r, _ := st.Get("panicky"); r.Status != connector.StatusError {
+		t.Errorf("expected error status for the panicking connector, got %+v", r)
 	}
 }

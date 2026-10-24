@@ -36,7 +36,7 @@ type Connector interface {
 	ID() string
 	// DisplayName is a human-readable name shown in the dashboard.
 	DisplayName() string
-	// Sync performs an incremental sync against the third-party API. It
+	// Sync pulls data from the third-party API. It
 	// should be safe to call repeatedly and cheap to retry after failure.
 	Sync(ctx context.Context) (SyncResult, error)
 }

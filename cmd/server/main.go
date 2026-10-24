@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log"
 	"net/http"
 	"os"
@@ -26,9 +27,7 @@ func main() {
 	statusStore := store.NewMemoryStatusStore()
 	sched := scheduler.New(statusStore)
 
-	// Register connectors. Adding a new vendor is exactly this one line
-	// plus its Connector implementation — nothing else in the system needs
-	// to change.
+	// Adding a vendor = a Connector implementation plus one Register call.
 	ghUser := os.Getenv("GITHUB_USERNAME")
 	if ghUser == "" {
 		ghUser = "ASmbat"
@@ -39,7 +38,11 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	go sched.Start(ctx)
+	schedDone := make(chan struct{})
+	go func() {
+		sched.Start(ctx)
+		close(schedDone)
+	}()
 
 	h := handler.New(statusStore, sched)
 	srv := &http.Server{
@@ -51,7 +54,7 @@ func main() {
 
 	go func() {
 		log.Printf("listening on %s", addr)
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("server error: %v", err)
 		}
 	}()
@@ -62,7 +65,12 @@ func main() {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		log.Fatalf("graceful shutdown failed: %v", err)
+		log.Printf("http shutdown: %v", err)
+	}
+	select {
+	case <-schedDone: // in-flight syncs finished
+	case <-shutdownCtx.Done():
+		log.Println("timed out waiting for running syncs")
 	}
 	log.Println("shutdown complete")
 }

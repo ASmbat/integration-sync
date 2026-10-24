@@ -1,5 +1,7 @@
 # integration-sync
 
+[![CI](https://github.com/ASmbat/integration-sync/actions/workflows/ci.yml/badge.svg)](https://github.com/ASmbat/integration-sync/actions/workflows/ci.yml)
+
 A small Go framework for scheduling and monitoring third-party API
 integrations — the pattern behind most "connect your vendor" features:
 each integration runs on its own schedule, reports a normalized status,
@@ -9,7 +11,7 @@ needing to know vendor-specific details.
 ## Why this exists
 
 A compact demonstration of the integration-framework pattern: authentication,
-incremental sync, rate-limit handling, and error normalization, behind a
+pagination, rate-limit handling, and error normalization, behind a
 single `Connector` interface — so adding the next vendor is new code in one
 file, not a change to the scheduler or API.
 
@@ -17,13 +19,18 @@ file, not a change to the scheduler or API.
 
 - **`internal/connector`** — the `Connector` interface plus implementations.
   - `github.go` is a real connector: it hits the public GitHub API, handles
-    auth headers, parses rate-limit response headers, and distinguishes
-    "vendor says slow down" (`rate_limited`) from a hard failure (`error`).
+    auth headers, follows `Link`-header pagination, parses rate-limit
+    headers, and distinguishes "vendor says slow down" (`rate_limited`)
+    from a hard failure (`error`). It does a full sync of the user's
+    public repos each run.
   - `mock.go` is a deterministic fake vendor used for local demos and tests
     without depending on network access or real rate limits.
 - **`internal/scheduler`** — runs each registered connector on its own
   interval in its own goroutine, records results, and exposes `SyncNow` for
   on-demand/manual syncs (what a "reconnect" or "backfill" button would call).
+  Connectors can be registered before or after `Start`. Each connector runs
+  at most one sync at a time: a scheduled tick is skipped if a manual sync is
+  still running, and a manual sync waits for a running one to finish.
 - **`internal/store`** — an interface for persisting the latest status per
   connector, with an in-memory implementation. A production version would
   implement the same interface against a real database.
@@ -79,8 +86,17 @@ low unauthenticated rate limit — a good way to actually see the
 make test
 ```
 
-Covers the mock connector's failure cadence, the scheduler's immediate-sync
-and manual-sync behavior, and the HTTP handlers' status codes.
+Covers:
+- the GitHub connector against an `httptest` server: auth header, username
+  escaping, multi-page pagination, a runaway-pagination guard, and the
+  mapping of 429/403/404/bad JSON/network errors to statuses;
+- the scheduler: immediate sync on start, registering after start, no
+  overlapping syncs per connector, manual sync not blocked by other
+  connectors, and recovery from connector panics;
+- the status store and the HTTP handlers.
+
+Tests are synchronized with channels instead of `time.Sleep` and pass
+under `-race`.
 
 ## Design notes / trade-offs
 
@@ -90,7 +106,16 @@ and manual-sync behavior, and the HTTP handlers' status codes.
 - **In-memory store**: chosen for a runnable, dependency-free example. The
   `store.StatusStore` interface is the seam for swapping in Postgres or
   similar without touching the scheduler or handlers.
+- **Full sync, not incremental**: the GitHub connector re-reads all repos
+  each run. Incremental sync (e.g. `since`/`ETag` with `If-None-Match`) is
+  the natural next step and fits behind the same interface.
+- **No backoff yet**: a `rate_limited` result is retried on the next normal
+  tick. Honoring `X-RateLimit-Reset` would be the next improvement.
 - **No credential storage/rotation** included — out of scope for this
   example, but would sit behind the same `Connector` interface (a
   connector's constructor takes credentials; rotation just means
   constructing a new instance with fresh ones).
+
+## License
+
+MIT — see [LICENSE](LICENSE).

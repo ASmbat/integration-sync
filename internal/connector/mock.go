@@ -6,10 +6,9 @@ import (
 	"time"
 )
 
-// MockConnector simulates a flaky third-party vendor: it fails on a
-// configurable cadence so the scheduler's retry/backoff behaviour can be
-// exercised without depending on a real, rate-limited API. Useful both as
-// a demo connector and as a test double.
+// MockConnector simulates a flaky vendor: every FailEveryN-th call reports
+// a rate limit. It is used as a demo connector and as a test double, so the
+// status paths can be exercised without a real API.
 type MockConnector struct {
 	Name       string
 	FailEveryN int // 0 disables simulated failures

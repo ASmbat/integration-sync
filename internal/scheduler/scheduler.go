@@ -1,6 +1,6 @@
 // Package scheduler runs registered connectors on independent intervals
-// and records their results in a StatusStore, decoupling "when do we sync"
-// from "how does each vendor sync."
+// and records their results in a StatusStore. It decides *when* to sync;
+// each connector decides *how*.
 package scheduler
 
 import (
@@ -17,47 +17,67 @@ import (
 type job struct {
 	conn     connector.Connector
 	interval time.Duration
+	running  sync.Mutex // one Sync at a time per connector
 }
 
 type Scheduler struct {
 	statusStore store.StatusStore
-	jobs        []job
-	mu          sync.Mutex
+
+	mu      sync.Mutex
+	jobs    []*job
+	ctx     context.Context // set while Start is running
+	stopped bool
+	loops   sync.WaitGroup
 }
 
 func New(statusStore store.StatusStore) *Scheduler {
 	return &Scheduler{statusStore: statusStore}
 }
 
-// Register adds a connector to be synced on the given interval. Call
-// before Start; safe to call again later to add connectors dynamically.
+// Register adds a connector to sync every interval. It can be called before
+// or after Start; a connector registered while the scheduler is running
+// starts its loop right away.
 func (s *Scheduler) Register(c connector.Connector, interval time.Duration) {
+	j := &job{conn: c, interval: interval}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.jobs = append(s.jobs, job{conn: c, interval: interval})
+	s.jobs = append(s.jobs, j)
+	if s.ctx != nil && !s.stopped {
+		s.startLoop(s.ctx, j)
+	}
 }
 
-// Start launches one goroutine per registered connector and runs an
-// immediate sync before entering the ticker loop. It blocks until ctx is
-// cancelled.
+// Start runs one loop per connector, each doing an immediate sync and then
+// syncing on its interval. It blocks until ctx is cancelled and all loops
+// have returned.
 func (s *Scheduler) Start(ctx context.Context) {
 	s.mu.Lock()
-	jobs := append([]job(nil), s.jobs...)
+	s.ctx = ctx
+	for _, j := range s.jobs {
+		s.startLoop(ctx, j)
+	}
 	s.mu.Unlock()
 
-	var wg sync.WaitGroup
-	for _, j := range jobs {
-		wg.Add(1)
-		go func(j job) {
-			defer wg.Done()
-			s.runLoop(ctx, j)
-		}(j)
-	}
-	wg.Wait()
+	<-ctx.Done()
+
+	s.mu.Lock()
+	s.stopped = true // no new loops after this point
+	s.mu.Unlock()
+	s.loops.Wait()
 }
 
-func (s *Scheduler) runLoop(ctx context.Context, j job) {
-	s.syncOnce(ctx, j.conn)
+// startLoop must be called with s.mu held.
+func (s *Scheduler) startLoop(ctx context.Context, j *job) {
+	s.loops.Add(1)
+	go func() {
+		defer s.loops.Done()
+		s.runLoop(ctx, j)
+	}()
+}
+
+func (s *Scheduler) runLoop(ctx context.Context, j *job) {
+	s.syncOnce(ctx, j)
 
 	ticker := time.NewTicker(j.interval)
 	defer ticker.Stop()
@@ -67,25 +87,28 @@ func (s *Scheduler) runLoop(ctx context.Context, j job) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			s.syncOnce(ctx, j.conn)
+			// Skip this tick if a manual sync is still running, instead
+			// of queueing up overlapping syncs against the vendor.
+			if !j.running.TryLock() {
+				continue
+			}
+			s.syncLocked(ctx, j)
+			j.running.Unlock()
 		}
 	}
 }
 
-// SyncNow triggers an immediate, out-of-cycle sync for a single connector
-// (used by the manual "sync now" API endpoint).
+// SyncNow runs an immediate, out-of-cycle sync for one connector (used by
+// the manual "sync now" endpoint). If a sync for that connector is already
+// running, it waits for it to finish first.
 func (s *Scheduler) SyncNow(ctx context.Context, id string) (connector.SyncResult, bool) {
-	// Look up the connector under the lock, but release it before actually
-	// running Sync. Sync is a network call to a third-party vendor that can
-	// take seconds (or the full context timeout) to return; holding the
-	// scheduler's mutex across that call would serialize manual syncs for
-	// every connector behind whichever one happens to be slow or stuck,
-	// even though connectors are otherwise fully independent.
+	// Only the lookup holds s.mu. Sync can take seconds, and holding the
+	// scheduler lock during it would block every other connector.
 	s.mu.Lock()
-	var target connector.Connector
+	var target *job
 	for _, j := range s.jobs {
 		if j.conn.ID() == id {
-			target = j.conn
+			target = j
 			break
 		}
 	}
@@ -97,8 +120,15 @@ func (s *Scheduler) SyncNow(ctx context.Context, id string) (connector.SyncResul
 	return s.syncOnce(ctx, target), true
 }
 
-func (s *Scheduler) syncOnce(ctx context.Context, c connector.Connector) connector.SyncResult {
-	result, err := s.invoke(ctx, c)
+func (s *Scheduler) syncOnce(ctx context.Context, j *job) connector.SyncResult {
+	j.running.Lock()
+	defer j.running.Unlock()
+	return s.syncLocked(ctx, j)
+}
+
+// syncLocked runs the sync and stores the result. j.running must be held.
+func (s *Scheduler) syncLocked(ctx context.Context, j *job) connector.SyncResult {
+	result, err := invoke(ctx, j.conn)
 	if err != nil {
 		result = connector.SyncResult{
 			Status:   connector.StatusError,
@@ -106,19 +136,14 @@ func (s *Scheduler) syncOnce(ctx context.Context, c connector.Connector) connect
 			SyncedAt: time.Now(),
 		}
 	}
-	s.statusStore.Set(c.ID(), result)
-	log.Printf("connector=%s status=%s records=%d msg=%q", c.ID(), result.Status, result.RecordsSynced, result.Message)
+	s.statusStore.Set(j.conn.ID(), result)
+	log.Printf("connector=%s status=%s records=%d msg=%q", j.conn.ID(), result.Status, result.RecordsSynced, result.Message)
 	return result
 }
 
-// invoke runs c.Sync, converting a panic into an error instead of letting
-// it unwind out of this goroutine. Connectors wrap third-party vendor code
-// (parsing whatever a vendor's API happens to return), and an unrecovered
-// panic in any goroutine crashes the entire process — so without this, a
-// bug triggered by one vendor's response would take down every other
-// connector and the whole API, not just the one that misbehaved. That's
-// exactly the isolation this package exists to provide.
-func (s *Scheduler) invoke(ctx context.Context, c connector.Connector) (result connector.SyncResult, err error) {
+// invoke runs c.Sync and turns a panic into an error, so a bug in one
+// vendor's connector can't crash the process and every other connector.
+func invoke(ctx context.Context, c connector.Connector) (result connector.SyncResult, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("scheduler: recovered panic in connector %q: %v", c.ID(), r)
