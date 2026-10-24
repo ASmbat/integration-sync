@@ -10,7 +10,6 @@ import (
 )
 
 // GitHubConnector syncs public repository metadata for a GitHub user.
-// It's a real, working example of the messiness the role description
 // calls out: auth headers, rate-limit headers, pagination-shaped APIs,
 // and mapping HTTP-layer failures onto a normalized SyncResult.
 type GitHubConnector struct {
