@@ -1,12 +1,18 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
+	"time"
 
 	"github.com/ASmbat/integration-sync/internal/scheduler"
 	"github.com/ASmbat/integration-sync/internal/store"
 )
+
+// SyncTimeout bounds a manual sync. The server's WriteTimeout must be
+// longer than this, or the response would be cut off.
+const SyncTimeout = 30 * time.Second
 
 type Handler struct {
 	statusStore store.StatusStore
@@ -42,7 +48,11 @@ func (h *Handler) getStatus(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) syncNow(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	result, found := h.scheduler.SyncNow(r.Context(), id)
+	// Detach from the request: if the client disconnects, the sync still
+	// finishes and its status is saved, but it can't run longer than SyncTimeout.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), SyncTimeout)
+	defer cancel()
+	result, found := h.scheduler.SyncNow(ctx, id)
 	if !found {
 		writeError(w, http.StatusNotFound, "unknown connector "+id)
 		return

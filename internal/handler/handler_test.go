@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -14,7 +15,9 @@ import (
 func newTestHandler() (*Handler, *scheduler.Scheduler) {
 	statusStore := store.NewMemoryStatusStore()
 	sched := scheduler.New(statusStore)
-	sched.Register(connector.NewMockConnector("demo", 0), time.Hour)
+	if err := sched.Register(connector.NewMockConnector("demo", 0), time.Hour); err != nil {
+		panic(err)
+	}
 	return New(statusStore, sched), sched
 }
 
@@ -86,5 +89,19 @@ func TestHealthz(t *testing.T) {
 
 	if rr.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", rr.Code)
+	}
+}
+
+func TestSyncNow_FinishesEvenIfClientDisconnects(t *testing.T) {
+	h, _ := newTestHandler()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // client already gone
+	req := httptest.NewRequest(http.MethodPost, "/connectors/demo/sync", nil).WithContext(ctx)
+	h.Routes().ServeHTTP(httptest.NewRecorder(), req)
+
+	status, ok := h.statusStore.Get("demo")
+	if !ok || status.Status != connector.StatusOK {
+		t.Fatalf("sync should run and be saved despite the disconnect, got %+v (ok=%v)", status, ok)
 	}
 }

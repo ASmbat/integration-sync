@@ -5,6 +5,7 @@ package scheduler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"sync"
@@ -20,12 +21,19 @@ type job struct {
 	running  sync.Mutex // one Sync at a time per connector
 }
 
+var (
+	ErrDuplicateID     = errors.New("connector id already registered")
+	ErrInvalidInterval = errors.New("interval must be positive")
+	ErrAlreadyStarted  = errors.New("scheduler already started")
+)
+
 type Scheduler struct {
 	statusStore store.StatusStore
 
 	mu      sync.Mutex
 	jobs    []*job
 	ctx     context.Context // set while Start is running
+	started bool
 	stopped bool
 	loops   sync.WaitGroup
 }
@@ -36,23 +44,37 @@ func New(statusStore store.StatusStore) *Scheduler {
 
 // Register adds a connector to sync every interval. It can be called before
 // or after Start; a connector registered while the scheduler is running
-// starts its loop right away.
-func (s *Scheduler) Register(c connector.Connector, interval time.Duration) {
+// starts its loop right away. IDs must be unique.
+func (s *Scheduler) Register(c connector.Connector, interval time.Duration) error {
+	if interval <= 0 {
+		return fmt.Errorf("%w: %s for %q", ErrInvalidInterval, interval, c.ID())
+	}
 	j := &job{conn: c, interval: interval}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	for _, existing := range s.jobs {
+		if existing.conn.ID() == c.ID() {
+			return fmt.Errorf("%w: %q", ErrDuplicateID, c.ID())
+		}
+	}
 	s.jobs = append(s.jobs, j)
-	if s.ctx != nil && !s.stopped {
+	if s.started && !s.stopped {
 		s.startLoop(s.ctx, j)
 	}
+	return nil
 }
 
 // Start runs one loop per connector, each doing an immediate sync and then
 // syncing on its interval. It blocks until ctx is cancelled and all loops
-// have returned.
-func (s *Scheduler) Start(ctx context.Context) {
+// have returned. A Scheduler can be started only once.
+func (s *Scheduler) Start(ctx context.Context) error {
 	s.mu.Lock()
+	if s.started {
+		s.mu.Unlock()
+		return ErrAlreadyStarted
+	}
+	s.started = true
 	s.ctx = ctx
 	for _, j := range s.jobs {
 		s.startLoop(ctx, j)
@@ -65,6 +87,7 @@ func (s *Scheduler) Start(ctx context.Context) {
 	s.stopped = true // no new loops after this point
 	s.mu.Unlock()
 	s.loops.Wait()
+	return nil
 }
 
 // startLoop must be called with s.mu held.
@@ -129,6 +152,16 @@ func (s *Scheduler) syncOnce(ctx context.Context, j *job) connector.SyncResult {
 // syncLocked runs the sync and stores the result. j.running must be held.
 func (s *Scheduler) syncLocked(ctx context.Context, j *job) connector.SyncResult {
 	result, err := invoke(ctx, j.conn)
+	switch {
+	case errors.Is(ctx.Err(), context.Canceled):
+		// Shutdown: keep the last real status instead of overwriting it
+		// with a "context canceled" error that says nothing about the vendor.
+		log.Printf("connector=%s sync cancelled", j.conn.ID())
+		return connector.SyncResult{Status: connector.StatusError, Message: "sync cancelled", SyncedAt: time.Now()}
+	case errors.Is(ctx.Err(), context.DeadlineExceeded):
+		// A timeout is real information about the vendor, so it is saved.
+		result, err = connector.SyncResult{Status: connector.StatusError, Message: "sync timed out", SyncedAt: time.Now()}, nil
+	}
 	if err != nil {
 		result = connector.SyncResult{
 			Status:   connector.StatusError,

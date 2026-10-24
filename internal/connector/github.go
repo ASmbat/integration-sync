@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -90,7 +91,12 @@ func (c *GitHubConnector) fetchPage(ctx context.Context, pageURL string) (repos 
 	if err != nil {
 		return nil, nil, failed(StatusError, err.Error()), false
 	}
-	defer resp.Body.Close()
+	body := resp.Body // not resp: it is a named result and may be nil when this runs
+	defer func() {
+		// Drain a little of any unread body so the connection can be reused.
+		_, _ = io.Copy(io.Discard, io.LimitReader(body, 64<<10))
+		body.Close()
+	}()
 
 	// GitHub signals rate limiting with 429, or 403 plus a zero remaining
 	// quota. Telling this apart from a real rejection lets callers back off

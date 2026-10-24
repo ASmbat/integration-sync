@@ -32,15 +32,21 @@ func main() {
 	if ghUser == "" {
 		ghUser = "ASmbat"
 	}
-	sched.Register(connector.NewGitHubConnector(ghUser, os.Getenv("GITHUB_TOKEN")), 5*time.Minute)
-	sched.Register(connector.NewMockConnector("billing-vendor-demo", 4), 30*time.Second)
+	if err := sched.Register(connector.NewGitHubConnector(ghUser, os.Getenv("GITHUB_TOKEN")), 5*time.Minute); err != nil {
+		log.Fatal(err)
+	}
+	if err := sched.Register(connector.NewMockConnector("billing-vendor-demo", 4), 30*time.Second); err != nil {
+		log.Fatal(err)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	schedDone := make(chan struct{})
 	go func() {
-		sched.Start(ctx)
+		if err := sched.Start(ctx); err != nil {
+			log.Printf("scheduler: %v", err)
+		}
 		close(schedDone)
 	}()
 
@@ -49,7 +55,7 @@ func main() {
 		Addr:         addr,
 		Handler:      h.Routes(),
 		ReadTimeout:  5 * time.Second,
-		WriteTimeout: 10 * time.Second,
+		WriteTimeout: handler.SyncTimeout + 5*time.Second, // POST /sync can take up to SyncTimeout
 	}
 
 	go func() {

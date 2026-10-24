@@ -28,7 +28,8 @@ file, not a change to the scheduler or API.
 - **`internal/scheduler`** — runs each registered connector on its own
   interval in its own goroutine, records results, and exposes `SyncNow` for
   on-demand/manual syncs (what a "reconnect" or "backfill" button would call).
-  Connectors can be registered before or after `Start`. Each connector runs
+  Connectors can be registered before or after `Start`; `Register` rejects
+  duplicate IDs and non-positive intervals. Each connector runs
   at most one sync at a time: a scheduled tick is skipped if a manual sync is
   still running, and a manual sync waits for a running one to finish.
 - **`internal/store`** — an interface for persisting the latest status per
@@ -109,6 +110,13 @@ under `-race`.
 - **Full sync, not incremental**: the GitHub connector re-reads all repos
   each run. Incremental sync (e.g. `since`/`ETag` with `If-None-Match`) is
   the natural next step and fits behind the same interface.
+- **Manual sync is detached from the request**: if the client disconnects,
+  the sync still finishes and its status is saved; it is bounded by a 30s
+  timeout. A timeout is saved as an error, while a shutdown cancellation
+  keeps the last real status instead of overwriting it.
+- **No auth on the API**: `POST /connectors/{id}/sync` is open, so in a real
+  deployment it would sit behind auth or a rate limit (each call uses the
+  vendor's API quota).
 - **No backoff yet**: a `rate_limited` result is retried on the next normal
   tick. Honoring `X-RateLimit-Reset` would be the next improvement.
 - **No credential storage/rotation** included — out of scope for this
